@@ -7,7 +7,7 @@
 #
 # Reads:  bpil-galar-pvc  (/galar, read-only)  shards + splits_publication
 #         bpil-amit-pvc   (/pvc,   read-only)  results/galar_tar_index.pkl only, loaded once
-# Writes: modex-galar-out:/amit/modex-galar/{results_modex_galar,models_modex_galar}/
+# Writes: modex-results:/amit/modex-galar/{results_modex_galar,models_modex_galar}/
 #         plus train.log there.
 #
 # Submit: kubectl apply -f nautilus/amit-train-galar-job.yaml -n usd-djha
@@ -98,7 +98,7 @@ spec:
         - name: index
           persistentVolumeClaim: { claimName: bpil-amit-pvc }
         - name: out
-          persistentVolumeClaim: { claimName: modex-galar-out }
+          persistentVolumeClaim: { claimName: modex-results }
         - name: workspace
           emptyDir: {}
         - name: dshm
