@@ -6,7 +6,7 @@
 # PNGs on three PVCs. image_dir is only used for frames that are not in any shard.
 #
 # Reads:  bpil-galar-pvc  (/galar, read-only)  shards + splits_publication
-#         modex-galar-out:/amit/galar_tar_index.pkl (built by amit-galar-check-job.yaml)
+#         bpil-amit-pvc   (/pvc,   read-only)  results/galar_tar_index.pkl only, loaded once
 # Writes: modex-galar-out:/amit/modex-galar/{results_modex_galar,models_modex_galar}/
 #         plus train.log there.
 #
@@ -71,7 +71,7 @@ spec:
               mkdir -p /out/amit/modex-galar
               nvidia-smi --query-gpu=name,memory.total --format=csv | tee -a /out/amit/modex-galar/train.log
               python -u main_galar_c.py \
-                --tar_index /out/amit/galar_tar_index.pkl \
+                --tar_index /pvc/results/galar_tar_index.pkl \
                 --shard_dir /galar/galar/shards \
                 --image_dir /galar/galar/frames \
                 --split_path /galar/galar/splits_publication \
@@ -87,12 +87,15 @@ spec:
             limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
           volumeMounts:
             - { name: galar,     mountPath: /galar, readOnly: true }
+            - { name: index,     mountPath: /pvc,   readOnly: true }   # tar index only, read once at start
             - { name: out,       mountPath: /out }
             - { name: workspace, mountPath: /workspace }
             - { name: dshm,      mountPath: /dev/shm }
       volumes:
         - name: galar
           persistentVolumeClaim: { claimName: bpil-galar-pvc }
+        - name: index
+          persistentVolumeClaim: { claimName: bpil-amit-pvc }
         - name: out
           persistentVolumeClaim: { claimName: modex-galar-out }
         - name: workspace
