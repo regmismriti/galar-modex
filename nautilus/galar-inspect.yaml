@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: galar-inspect
+  namespace: usd-djha
+spec:
+  restartPolicy: Never
+  containers:
+    - name: shell
+      image: alpine:3.19
+      command: ["sh", "-c", "sleep infinity"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+          readOnly: true
+      resources:
+        requests:
+          cpu: "200m"
+          memory: 256Mi
+        limits:
+          cpu: "500m"
+          memory: 512Mi
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: bpil-galar-pvc

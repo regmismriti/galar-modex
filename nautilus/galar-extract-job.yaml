@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: galar-extract
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: extract
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache p7zip coreutils
+
+              echo "===================================================================="
+              echo "[extract] STATE BEFORE"
+              echo "===================================================================="
+              echo "src (bpil-galar-pvc, RO):"
+              df -h /src || true
+              echo ""
+              echo "dst (bpil-galar-work, RW):"
+              df -h /dst || true
+              echo ""
+              mkdir -p /dst/galar-frames
+              echo "current /dst/galar-frames contents:"
+              ls /dst/galar-frames 2>/dev/null || echo "  (empty)"
+
+              # Pattern-extract only the missing videos into /dst/galar-frames.
+              # Order picks the biggest archive first so if anything stalls, the most
+              # valuable data got out. Format: "<archive>:<video-id>[,<video-id>...]"
+              JOBS="Galar_Frames_41_to_50.7z:49,50
+              Galar_Frames_71_to_80_v2.7z:71,72,73,74,75,76,77,78,79,80
+              Galar_Frames_51_to_60.7z:58,59,60"
+
+              echo "$JOBS" | while IFS=: read -r arc vids; do
+                arc="$(echo "$arc" | tr -d ' ')"
+                vids_space=$(echo "$vids" | tr ',' ' ')
+                if [ ! -f "/src/galar/archives/$arc" ]; then
+                  echo "[extract] SKIP $arc (not found)"
+                  continue
+                fi
+
+                # Extract one target video at a time so a wedge only loses one video's
+                # worth of work, and force fsync between videos so pending writes to
+                # Ceph never build up into a burst that stalls an OSD.
+                for vid in $vids_space; do
+                  echo ""
+                  echo "===================================================================="
+                  echo "[extract] START $arc  video: $vid  ($(date -u +%FT%TZ))"
+                  df -h /dst
+                  echo "===================================================================="
+
+                  # -mmt=off: single-threaded decompression, throttles the write rate
+                  # so we don't overwhelm Ceph. Slower but far less wedge-prone.
+                  7z x -y -bb1 -r -mmt=off -o/dst/galar-frames "/src/galar/archives/$arc" "$vid"
+
+                  echo "[extract] flushing writes to /dst..."
+                  sync
+                  echo "[extract] DONE  $arc video $vid  ($(date -u +%FT%TZ))"
+                  echo "[extract] video folders now in /dst/galar-frames: $(ls /dst/galar-frames | wc -l)"
+                  df -h /dst
+                done
+              done
+
+              echo ""
+              echo "===================================================================="
+              echo "[extract] ALL DONE"
+              echo "final video folder count in /dst/galar-frames: $(ls /dst/galar-frames | wc -l)"
+              echo "final PNG file count in /dst/galar-frames:     $(find /dst/galar-frames -type f -name '*.PNG' | wc -l)"
+              df -h /dst
+              echo "===================================================================="
+          volumeMounts:
+            - name: galar-src
+              mountPath: /src
+              readOnly: true
+            - name: galar-dst
+              mountPath: /dst
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: galar-src
+          persistentVolumeClaim:
+            claimName: bpil-galar-pvc
+        - name: galar-dst
+          persistentVolumeClaim:
+            claimName: bpil-galar-work

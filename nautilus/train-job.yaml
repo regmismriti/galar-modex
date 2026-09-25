@@ -1,0 +1,74 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: modex-train-mnist-lt-heavy
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-GTX-1080
+                      - NVIDIA-GeForce-GTX-1080-Ti
+                      - NVIDIA-GeForce-RTX-2080-Ti
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-TITAN-Xp
+                      - NVIDIA-TITAN-X-Pascal
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - Tesla-T4
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-A10
+                      - NVIDIA-L4
+      containers:
+        - name: train
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          workingDir: /mnt/modex/code
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir tqdm scikit-learn pillow ddu-dirty-mnist
+              mkdir -p /mnt/modex/results /mnt/modex/checkpoints
+              python -u main.py \
+                --ID_dataset MNIST \
+                --imbalance_factor 0.01 \
+                --num_epochs 200 \
+                --result_dir /mnt/modex/results \
+                --model_dir /mnt/modex/checkpoints
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          volumeMounts:
+            - name: modex
+              mountPath: /mnt/modex
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: modex
+          persistentVolumeClaim:
+            claimName: modex-data
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

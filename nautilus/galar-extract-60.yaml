@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: galar-extract-60
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: extract
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache p7zip coreutils
+
+              mkdir -p /out/galar-frames
+              echo "[extract-60] STATE BEFORE"
+              df -h /out
+              echo "current /out/galar-frames contents:"
+              ls /out/galar-frames 2>/dev/null || echo "  (empty)"
+              echo ""
+
+              arc="Galar_Frames_51_to_60.7z"
+              # Videos 58 and 59 turned out to be partial on /work (extraction died
+              # mid-run). Re-extract to /out so the loader (which prefers /out) uses
+              # complete copies. Video 60 is already on /out from the previous run.
+              VIDS="58 59"
+
+              if [ ! -f "/src/galar/archives/$arc" ]; then
+                echo "[extract-60] ERROR: $arc not found under /src/galar/archives/"
+                exit 1
+              fi
+
+              for vid in $VIDS; do
+                echo "===================================================================="
+                echo "[extract-60] START $arc video $vid  ($(date -u +%FT%TZ))"
+                df -h /out
+                echo "===================================================================="
+
+                # Remove any prior partial copy of this video under /out first
+                rm -rf "/out/galar-frames/$vid"
+
+                7z x -y -bb1 -r -mmt=off -o/out/galar-frames "/src/galar/archives/$arc" "$vid"
+
+                echo "[extract-60] flushing writes..."
+                sync
+                echo "[extract-60] DONE  $arc video $vid  ($(date -u +%FT%TZ))"
+                echo "[extract-60] video folders in /out/galar-frames: $(ls /out/galar-frames | wc -l)"
+                echo "[extract-60] PNGs in /out/galar-frames/$vid:      $(find /out/galar-frames/$vid -type f -name '*.PNG' 2>/dev/null | wc -l)"
+                df -h /out
+              done
+          volumeMounts:
+            - name: galar-src
+              mountPath: /src
+              readOnly: true
+            - name: galar-out
+              mountPath: /out
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: galar-src
+          persistentVolumeClaim:
+            claimName: bpil-galar-pvc
+        - name: galar-out
+          persistentVolumeClaim:
+            claimName: modex-galar-out

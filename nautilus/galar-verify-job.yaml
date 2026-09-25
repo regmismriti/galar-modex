@@ -1,0 +1,144 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: galar-verify
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: verify
+          image: python:3.11-slim
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --quiet --no-cache-dir pandas
+
+              python - <<'PY'
+              import os, sys
+              import pandas as pd
+
+              IMAGE_DIRS = ["/out/galar-frames", "/work/galar-frames", "/data/galar/frames"]
+              SPLIT_ROOT = "/data/galar/splits_publication/section"
+
+              csvs = [
+                  os.path.join(SPLIT_ROOT, "split_0", "train.csv"),
+                  os.path.join(SPLIT_ROOT, "split_0", "val.csv"),
+                  os.path.join(SPLIT_ROOT, "test.csv"),
+              ]
+
+              rows = []
+              for c in csvs:
+                  df = pd.read_csv(c, dtype={"unknown": "str"} if "unknown" in pd.read_csv(c, nrows=0).columns else None)
+                  if "unknown" in df.columns:
+                      df = df[df["unknown"].fillna("0") == "0"]
+                  df = df[["path"]].copy()
+                  df["csv"] = os.path.basename(c)
+                  rows.append(df)
+              all_paths = pd.concat(rows, ignore_index=True)
+              all_paths["video"] = all_paths["path"].astype(str).str.split("/").str[0]
+              print(f"[verify] total CSV rows to check: {len(all_paths)}")
+              print(f"[verify] unique videos in CSVs:   {all_paths['video'].nunique()}")
+
+              # 1. Expected file count per video from CSV
+              expected = all_paths.groupby("video").size().to_dict()
+
+              # 2. Actual PNG counts per video per image_dir
+              print("")
+              print(f"[verify] per-image_dir PNG counts (fast: os.listdir):")
+              disk_counts = {}
+              for base in IMAGE_DIRS:
+                  if not os.path.isdir(base):
+                      print(f"  {base}: MISSING")
+                      continue
+                  for v in sorted(os.listdir(base)):
+                      p = os.path.join(base, v)
+                      if not os.path.isdir(p):
+                          continue
+                      n = sum(1 for f in os.listdir(p) if f.endswith(".PNG"))
+                      disk_counts.setdefault(v, {})[base] = n
+                      print(f"  {base}/{v}: {n}")
+
+              # 3. For each video referenced by CSV, does any image_dir have >= expected count?
+              print("")
+              print(f"[verify] per-video status (expected = distinct CSV rows for that video):")
+              partial = []
+              missing_video = []
+              for v in sorted(expected.keys(), key=lambda s: int(s) if s.isdigit() else s):
+                  need = expected[v]
+                  bases = disk_counts.get(v, {})
+                  best_base = max(bases, key=bases.get) if bases else None
+                  best_count = bases.get(best_base, 0) if best_base else 0
+                  status = "OK" if best_count >= need else ("PARTIAL" if best_count > 0 else "MISSING")
+                  print(f"  video {v:>3}: needs {need:>7}, disk-best {best_count:>7} ({best_base}) -> {status}")
+                  if status == "PARTIAL":
+                      partial.append((v, need, best_count, best_base))
+                  elif status == "MISSING":
+                      missing_video.append((v, need))
+
+              print("")
+              print(f"[verify] SUMMARY")
+              print(f"  complete videos:  {len(expected) - len(partial) - len(missing_video)} / {len(expected)}")
+              print(f"  partial videos:   {len(partial)}")
+              print(f"  missing videos:   {len(missing_video)}")
+
+              if partial:
+                  print("")
+                  print("[verify] PARTIAL videos to re-extract:")
+                  for v, need, got, base in partial:
+                      print(f"  video {v}: have {got} in {base}, need {need}, gap {need-got}")
+
+              if missing_video:
+                  print("")
+                  print("[verify] MISSING videos (no disk copy anywhere):")
+                  for v, need in missing_video:
+                      print(f"  video {v}: need {need} frames")
+
+              # 4. Spot-check: pick 10 random CSV paths and verify their files exist across image_dirs.
+              # Catches gaps within a "complete-looking" video (e.g., a hole in the middle).
+              print("")
+              print(f"[verify] spot-checking 100 random CSV paths for actual file existence:")
+              sample = all_paths.sample(min(100, len(all_paths)), random_state=42)
+              missed = 0
+              for _, row in sample.iterrows():
+                  rel = row["path"]
+                  if not any(os.path.exists(os.path.join(b, rel)) for b in IMAGE_DIRS):
+                      missed += 1
+                      if missed <= 10:
+                          print(f"  MISSING: {rel}")
+              print(f"[verify] spot-check: {missed}/100 sampled paths not found")
+
+              # Exit code: 0 if all videos OK, 1 otherwise (so kubectl waits/logs make it obvious)
+              sys.exit(0 if (not partial and not missing_video and missed == 0) else 1)
+              PY
+          volumeMounts:
+            - name: galar-data
+              mountPath: /data
+              readOnly: true
+            - name: galar-work
+              mountPath: /work
+              readOnly: true
+            - name: galar-out
+              mountPath: /out
+              readOnly: true
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: galar-data
+          persistentVolumeClaim:
+            claimName: bpil-galar-pvc
+        - name: galar-work
+          persistentVolumeClaim:
+            claimName: bpil-galar-work
+        - name: galar-out
+          persistentVolumeClaim:
+            claimName: modex-galar-out

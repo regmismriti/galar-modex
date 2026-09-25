@@ -1,0 +1,139 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: galar-redownload
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: redownload
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache p7zip curl coreutils
+
+              echo "===================================================================="
+              echo "[redownload] STATE BEFORE"
+              echo "===================================================================="
+              df -h /src
+              echo ""
+              echo "archives on /src/galar/archives:"
+              ls -lh /src/galar/archives 2>/dev/null || echo "(none)"
+
+              echo ""
+              echo "===================================================================="
+              echo "[cleanup] Deleting already-extracted archives from /src/galar/archives"
+              echo "===================================================================="
+              # These 3 archives' videos are already fully extracted to /out or /work
+              # (verify job confirmed). Safe to delete.
+              for arc in Galar_Frames_41_to_50.7z Galar_Frames_51_to_60.7z Galar_Frames_71_to_80_v2.7z; do
+                if [ -f "/src/galar/archives/$arc" ]; then
+                  echo "  rm /src/galar/archives/$arc"
+                  rm -f "/src/galar/archives/$arc"
+                fi
+              done
+              sync
+              echo ""
+              echo "[cleanup] after deletes:"
+              df -h /src
+
+              # ---- Archive 1: Galar_Frames_61_to_70.7z (file id 44724651) ----
+              arc1="Galar_Frames_61_to_70.7z"
+              url1="https://ndownloader.figshare.com/files/44724651"
+
+              echo ""
+              echo "===================================================================="
+              echo "[download] $arc1  ($(date -u +%FT%TZ))"
+              echo "  url: $url1"
+              echo "===================================================================="
+              cd /src/galar/archives
+              curl -L --progress-bar --retry 3 -o "$arc1" "$url1"
+              sync
+              echo "[download] done. size:"
+              ls -lh "/src/galar/archives/$arc1"
+              df -h /src
+
+              echo ""
+              echo "===================================================================="
+              echo "[extract] $arc1 -> videos 61,62,63,64,65,66,67,68,69,70 into /out/galar-frames"
+              echo "===================================================================="
+              for vid in 61 62 63 64 65 66 67 68 69 70; do
+                echo ""
+                echo "-- START video $vid ($(date -u +%FT%TZ))"
+                rm -rf "/out/galar-frames/$vid"
+                7z x -y -bb1 -r -mmt=off -o/out/galar-frames "/src/galar/archives/$arc1" "$vid"
+                sync
+                echo "-- DONE  video $vid ($(date -u +%FT%TZ))"
+                echo "-- PNGs in /out/galar-frames/$vid: $(find /out/galar-frames/$vid -type f -name '*.PNG' 2>/dev/null | wc -l)"
+                df -h /out
+              done
+
+              echo ""
+              echo "[cleanup] Deleting $arc1 (frames extracted)"
+              rm -f "/src/galar/archives/$arc1"
+              sync
+              df -h /src
+
+              # ---- Archive 2: Galar_Frames_21_to_29_2.7z (file id 45258019) ----
+              arc2="Galar_Frames_21_to_29_2.7z"
+              url2="https://ndownloader.figshare.com/files/45258019"
+
+              echo ""
+              echo "===================================================================="
+              echo "[download] $arc2  ($(date -u +%FT%TZ))"
+              echo "  url: $url2"
+              echo "===================================================================="
+              cd /src/galar/archives
+              curl -L --progress-bar --retry 3 -o "$arc2" "$url2"
+              sync
+              echo "[download] done. size:"
+              ls -lh "/src/galar/archives/$arc2"
+              df -h /src
+
+              echo ""
+              echo "===================================================================="
+              echo "[extract] $arc2 -> video 22 into /out/galar-frames"
+              echo "===================================================================="
+              rm -rf "/out/galar-frames/22"
+              7z x -y -bb1 -r -mmt=off -o/out/galar-frames "/src/galar/archives/$arc2" 22
+              sync
+              echo "PNGs in /out/galar-frames/22: $(find /out/galar-frames/22 -type f -name '*.PNG' 2>/dev/null | wc -l)"
+              df -h /out
+
+              echo ""
+              echo "[cleanup] Deleting $arc2 (frame extracted)"
+              rm -f "/src/galar/archives/$arc2"
+              sync
+
+              echo ""
+              echo "===================================================================="
+              echo "[redownload] ALL DONE  ($(date -u +%FT%TZ))"
+              echo "video folders in /out/galar-frames: $(ls /out/galar-frames | wc -l)"
+              df -h /src
+              df -h /out
+              echo "===================================================================="
+          volumeMounts:
+            - name: galar-src
+              mountPath: /src
+            - name: galar-out
+              mountPath: /out
+          resources:
+            requests:
+              cpu: "4"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+      volumes:
+        - name: galar-src
+          persistentVolumeClaim:
+            claimName: bpil-galar-pvc
+        - name: galar-out
+          persistentVolumeClaim:
+            claimName: modex-galar-out

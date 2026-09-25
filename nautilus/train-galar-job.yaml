@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: modex-galar-section-fold0
+  namespace: usd-djha
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - Tesla-V100-SXM2-32GB
+                      - Tesla-V100-SXM2-16GB
+                      - Tesla-V100-PCIE-16GB
+                      - Tesla-T4
+                      - NVIDIA-A10
+                      - NVIDIA-L4
+                      - NVIDIA-RTX-A5000
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+      containers:
+        - name: train
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          workingDir: /mnt/modex/code
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir tqdm scikit-learn pillow pandas
+              python -u main_galar_c.py \
+                --image_dir /out/galar-frames,/work/galar-frames,/data/galar/frames \
+                --split_path /data/galar/splits_publication \
+                --training_features section \
+                --fold 0 \
+                --image_size 256 \
+                --batch_size 64 \
+                --num_workers 8 \
+                --num_epochs 50 \
+                --output_dir /out/modex-galar
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          volumeMounts:
+            - name: modex
+              mountPath: /mnt/modex
+            - name: galar-data
+              mountPath: /data
+              readOnly: true
+            - name: galar-work
+              mountPath: /work
+              readOnly: true
+            - name: galar-out
+              mountPath: /out
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+      volumes:
+        - name: modex
+          persistentVolumeClaim:
+            claimName: modex-data
+        - name: galar-data
+          persistentVolumeClaim:
+            claimName: bpil-galar-pvc
+        - name: galar-work
+          persistentVolumeClaim:
+            claimName: bpil-galar-work
+        - name: galar-out
+          persistentVolumeClaim:
+            claimName: modex-galar-out
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
