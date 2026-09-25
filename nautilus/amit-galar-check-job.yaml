@@ -1,0 +1,82 @@
+# amit-galar-check-job.yaml
+#
+# CPU-only dry run of the tar-index GALAR pipeline. Run this BEFORE the GPU job.
+# Builds train/val/test exactly as training would, reports per video how many
+# frames come from the tar shards / the loose-frame fallback / are dropped,
+# decodes a few frames and measures DataLoader throughput. No GPU requested.
+#
+# Reads:  bpil-galar-pvc  (/galar, read-only)  tar shards + splits_publication
+#         bpil-amit-pvc   (/pvc,   read-only)  /pvc/results/galar_tar_index.pkl
+# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/section_fold0/results_modex_galar/
+#         galar_section_fold0_data_report.json  and  check.log
+#
+# Submit: kubectl apply -f nautilus/amit-galar-check-job.yaml -n usd-djha
+# Logs:   kubectl logs -f job/amit-modex-galar-check -n usd-djha
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: amit-modex-galar-check
+  namespace: usd-djha
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: check
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: REPO, value: "https://github.com/regmismriti/galar-modex.git" }
+            - { name: BRANCH, value: "amit" }
+            - { name: OUT, value: "/out/amit/modex-galar/section_fold0" }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -q git > /dev/null
+              URL="$REPO"
+              if [ -n "${GITHUB_PAT:-}" ]; then URL=$(echo "$REPO" | sed "s|https://|https://${GITHUB_PAT}@|"); fi
+              git clone --branch "$BRANCH" --depth 1 "$URL" /workspace/galar-modex
+              cd /workspace/galar-modex && echo "code at $(git rev-parse --short HEAD)"
+              # Not requirements.txt: it pins torch 2.9.1+cu126, which would replace the image's torch.
+              pip install -q tqdm scikit-learn pillow pandas
+              mkdir -p "$OUT"
+              python -u main_galar_c.py \
+                --tar_index /pvc/results/galar_tar_index.pkl \
+                --shard_dir /galar/galar/shards \
+                --image_dir /galar/galar/frames \
+                --split_path /galar/galar/splits_publication \
+                --training_features section \
+                --fold 0 \
+                --image_size 256 \
+                --batch_size 64 \
+                --num_workers 10 \
+                --output_dir "$OUT" \
+                --check_data_only 2>&1 | tee "$OUT/check.log"
+          resources:
+            requests: { cpu: "10", memory: "16Gi" }
+            limits:   { cpu: "12", memory: "19Gi" }   # <= 1.2x request
+          volumeMounts:
+            - { name: galar,     mountPath: /galar, readOnly: true }
+            - { name: amit,      mountPath: /pvc,   readOnly: true }
+            - { name: out,       mountPath: /out }
+            - { name: workspace, mountPath: /workspace }
+            - { name: dshm,      mountPath: /dev/shm }
+      volumes:
+        - name: galar
+          persistentVolumeClaim: { claimName: bpil-galar-pvc }
+        - name: amit
+          persistentVolumeClaim: { claimName: bpil-amit-pvc }
+        - name: out
+          persistentVolumeClaim: { claimName: modex-galar-out }
+        - name: workspace
+          emptyDir: {}
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }

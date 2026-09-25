@@ -1,0 +1,115 @@
+# amit-train-galar-job.yaml
+#
+# MODEX on GALAR (section task, fold 0), reading frames from the tar shards via the
+# prebuilt offset index instead of the extracted PNGs spread over 3 PVCs.
+# Run nautilus/amit-galar-check-job.yaml first and check its data report.
+#
+# Reads:  bpil-galar-pvc  (/galar, read-only)  tar shards + splits_publication
+#         bpil-amit-pvc   (/pvc,   read-only)  /pvc/results/galar_tar_index.pkl
+# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/section_fold0/
+#           results_modex_galar/*.json   metrics + data report
+#           models_modex_galar/*.pt      final weights + per-epoch resume checkpoint
+#           train.log                    full stdout (pods are garbage-collected)
+#
+# Eviction-safe: a restarted pod resumes from models_modex_galar/*_last_ckpt.pt.
+# To start from scratch, delete that checkpoint or change OUT.
+#
+# GPU: >= 24 GB cards only. VGG16-bn @256px, batch 64, AMP needs roughly 8-10 GB,
+# so this leaves ample headroom; the per-epoch log prints actual peak GPU memory.
+#
+# Submit: kubectl apply -f nautilus/amit-train-galar-job.yaml -n usd-djha
+# Logs:   kubectl logs -f job/amit-modex-galar-section-f0 -n usd-djha
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: amit-modex-galar-section-f0
+  namespace: usd-djha
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 604800   # 7 days
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-TITAN-RTX
+                      - Quadro-RTX-6000
+                      - NVIDIA-RTX-A5000
+                      - NVIDIA-A10
+                      - NVIDIA-A40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-L40
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - nautilus-ext-gpu01.fullerton.edu
+                      - v100-cc-star-01.noc.ucsb.edu
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: train
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: TQDM_MININTERVAL, value: "60" }   # one progress line/min, not a flood
+            - { name: REPO, value: "https://github.com/regmismriti/galar-modex.git" }
+            - { name: BRANCH, value: "amit" }
+            - { name: OUT, value: "/out/amit/modex-galar/section_fold0" }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update -qq && apt-get install -y -q git > /dev/null
+              URL="$REPO"
+              if [ -n "${GITHUB_PAT:-}" ]; then URL=$(echo "$REPO" | sed "s|https://|https://${GITHUB_PAT}@|"); fi
+              git clone --branch "$BRANCH" --depth 1 "$URL" /workspace/galar-modex
+              cd /workspace/galar-modex && echo "code at $(git rev-parse --short HEAD)"
+              # Not requirements.txt: it pins torch 2.9.1+cu126, which would replace the image's torch.
+              pip install -q tqdm scikit-learn pillow pandas
+              mkdir -p "$OUT"
+              nvidia-smi --query-gpu=name,memory.total --format=csv | tee -a "$OUT/train.log"
+              python -u main_galar_c.py \
+                --tar_index /pvc/results/galar_tar_index.pkl \
+                --shard_dir /galar/galar/shards \
+                --image_dir /galar/galar/frames \
+                --split_path /galar/galar/splits_publication \
+                --training_features section \
+                --fold 0 \
+                --image_size 256 \
+                --batch_size 64 \
+                --num_workers 10 \
+                --num_epochs 50 \
+                --output_dir "$OUT" 2>&1 | tee -a "$OUT/train.log"
+          resources:
+            requests: { cpu: "12", memory: "32Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "12", memory: "36Gi", nvidia.com/gpu: "1" }   # <= 1.2x request
+          volumeMounts:
+            - { name: galar,     mountPath: /galar, readOnly: true }
+            - { name: amit,      mountPath: /pvc,   readOnly: true }
+            - { name: out,       mountPath: /out }
+            - { name: workspace, mountPath: /workspace }
+            - { name: dshm,      mountPath: /dev/shm }
+      volumes:
+        - name: galar
+          persistentVolumeClaim: { claimName: bpil-galar-pvc }
+        - name: amit
+          persistentVolumeClaim: { claimName: bpil-amit-pvc }
+        - name: out
+          persistentVolumeClaim: { claimName: modex-galar-out }
+        - name: workspace
+          emptyDir: {}
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }

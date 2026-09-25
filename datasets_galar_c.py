@@ -1,4 +1,9 @@
+import io
 import os
+import pickle
+import time
+from collections import Counter
+
 import pandas as pd
 import numpy as np
 import torch
@@ -12,6 +17,156 @@ NON_LABEL_COLUMNS = {"path", "unknown"}
 
 def _label_columns(df: pd.DataFrame):
     return [c for c in df.columns if c not in NON_LABEL_COLUMNS]
+
+
+def _norm_key(name):
+    """Canonical frame key '<video>/frame_NNNNNN.PNG'. The repaired 41_to_50 shard
+    has a leading './'; same normalisation the index builder (vce-triage
+    datasets/galar.py) applied, so CSV paths and index keys match."""
+    return os.path.normpath(str(name)).lstrip("./")
+
+
+def _read_split_csv(csv_path, label_cols):
+    """Same row filtering as GalarCSVDataset: drop unknown=1 rows and rows that do
+    not have exactly one active label. Returns (paths, targets)."""
+    df = pd.read_csv(
+        csv_path,
+        dtype={"unknown": "str"} if "unknown" in pd.read_csv(csv_path, nrows=0).columns else None,
+    )
+    if "unknown" in df.columns:
+        df = df[df["unknown"].fillna("0") == "0"].reset_index(drop=True)
+
+    onehot = df[label_cols].values.astype(np.int64)
+    keep = onehot.sum(axis=1) == 1
+    if not keep.all():
+        print(f"[datasets_galar] {csv_path}: dropped {int((~keep).sum())}/{len(df)} rows without exactly one active label")
+        df = df.loc[keep].reset_index(drop=True)
+        onehot = onehot[keep]
+    return df["path"].map(_norm_key).tolist(), onehot.argmax(axis=1).astype(np.int64)
+
+
+def load_tar_index(tar_index_path):
+    """Load the prebuilt {'shards', 'shards_dir', 'index': name -> (shard_idx, offset, size)}."""
+    t0 = time.time()
+    with open(tar_index_path, "rb") as f:
+        idx = pickle.load(f)
+    print(f"[datasets_galar] loaded tar index {tar_index_path}: {len(idx['index'])} frames, "
+          f"{len(idx['shards'])} shards ({time.time() - t0:.0f}s)")
+    return idx
+
+
+class GalarTarDataset(Dataset):
+    """Reads GALAR frames straight out of the tar shards via the offset index.
+
+    One large sequential file per ~10 videos instead of ~1.9M loose PNGs spread
+    over several CephFS PVCs. Frames missing from the index are dropped and
+    reported per video (never silently), optionally read from `fallback_dirs`.
+
+    Samples are held as flat numpy arrays (not the 3.5M-entry dict) so DataLoader
+    workers share them copy-on-write instead of each duplicating the index."""
+
+    def __init__(self, csv_path, index, shards_dir, transform, label_cols,
+                 fallback_dirs=(), max_per_class=None, seed=0, split="train"):
+        self.transform = transform
+        self.shard_paths = [os.path.join(shards_dir, s) for s in index["shards"]]
+        self._fh = None  # per-process file descriptors, opened lazily
+        self._fh_pid = None
+
+        paths, targets = _read_split_csv(csv_path, label_cols)
+        entries = index["index"]
+        in_index = np.fromiter((p in entries for p in paths), dtype=bool, count=len(paths))
+
+        # Frames not in the tar shards: optionally recover from a loose-frame dir.
+        # One listdir per affected video, never an os.path.exists per row.
+        fallback = np.zeros(len(paths), dtype=bool)
+        fallback_path = [None] * len(paths)
+        missing = np.where(~in_index)[0]
+        if len(missing) and fallback_dirs:
+            listing = {}
+            for i in missing:
+                video, fname = paths[i].split("/", 1)
+                for base in fallback_dirs:
+                    key = (base, video)
+                    if key not in listing:
+                        try:
+                            listing[key] = set(os.listdir(os.path.join(base, video)))
+                        except OSError:
+                            listing[key] = set()
+                    if fname in listing[key]:
+                        fallback[i] = True
+                        fallback_path[i] = os.path.join(base, paths[i])
+                        break
+
+        dropped = ~in_index & ~fallback
+        self.report = {
+            "csv": csv_path,
+            "rows": len(paths),
+            "from_tar": int(in_index.sum()),
+            "from_fallback_dir": int(fallback.sum()),
+            "dropped": int(dropped.sum()),
+            "fallback_per_video": dict(Counter(paths[i].split("/", 1)[0] for i in np.where(fallback)[0])),
+            "dropped_per_video": dict(Counter(paths[i].split("/", 1)[0] for i in np.where(dropped)[0])),
+        }
+        print(f"[datasets_galar] {split} {csv_path}: {self.report['rows']} rows -> "
+              f"{self.report['from_tar']} from tar, {self.report['from_fallback_dir']} from fallback dir, "
+              f"{self.report['dropped']} DROPPED")
+        if self.report["fallback_per_video"]:
+            print(f"[datasets_galar]   fallback per video: {self.report['fallback_per_video']}")
+        if self.report["dropped_per_video"]:
+            print(f"[datasets_galar]   DROPPED per video: {self.report['dropped_per_video']}")
+
+        keep = np.where(~dropped)[0]
+        if max_per_class:
+            rng = np.random.default_rng(seed)
+            capped = []
+            for c in np.unique(targets[keep]):
+                idx_c = keep[targets[keep] == c]
+                if len(idx_c) > max_per_class:
+                    idx_c = rng.choice(idx_c, max_per_class, replace=False)
+                capped.append(idx_c)
+            keep = np.sort(np.concatenate(capped))
+            print(f"[datasets_galar] {split}: capped to <= {max_per_class}/class -> {len(keep)} frames")
+
+        # shard == -1 marks a fallback (loose file) sample.
+        self.shard = np.full(len(keep), -1, dtype=np.int16)
+        self.offset = np.zeros(len(keep), dtype=np.int64)
+        self.size = np.zeros(len(keep), dtype=np.int64)
+        self.fallback_paths = {}
+        for j, i in enumerate(keep):
+            if in_index[i]:
+                self.shard[j], self.offset[j], self.size[j] = entries[paths[i]]
+            else:
+                self.fallback_paths[j] = fallback_path[i]
+        self.targets = targets[keep]
+        self.report["used"] = int(len(keep))
+        self.report["class_counts"] = {label_cols[c]: int(n) for c, n in
+                                       zip(*np.unique(self.targets, return_counts=True))}
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_fh"] = None  # fds are per-process; spawned workers reopen lazily
+        return state
+
+    def __len__(self):
+        return len(self.targets)
+
+    def _read(self, j):
+        si = int(self.shard[j])
+        if si < 0:
+            with open(self.fallback_paths[j], "rb") as f:
+                return f.read()
+        if self._fh is None or self._fh_pid != os.getpid():
+            self._fh, self._fh_pid = {}, os.getpid()  # never reuse a parent's fds
+        fd = self._fh.get(si)
+        if fd is None:
+            fd = os.open(self.shard_paths[si], os.O_RDONLY)
+            self._fh[si] = fd
+        return os.pread(fd, int(self.size[j]), int(self.offset[j]))
+
+    def __getitem__(self, j):
+        with Image.open(io.BytesIO(self._read(j))) as im:
+            img = self.transform(im.convert("RGB"))
+        return img, int(self.targets[j])
 
 
 class GalarCSVDataset(Dataset):
@@ -149,10 +304,17 @@ def load_galar(
     batch_size: int = 64,
     image_size: int = 256,
     num_workers: int = 8,
+    tar_index: str = None,
+    shard_dir: str = None,
+    max_per_class: int = None,
     **_ignored,
 ):
+    """With `tar_index`, frames are read from the tar shards and `image_dirs` is only
+    a fallback for frames absent from the shards. Without it, the legacy loose-PNG
+    path below is used. Returns (train_loader, val_loader, test_loader, label_cols, report)."""
     if isinstance(image_dirs, str):
         image_dirs = [d.strip() for d in image_dirs.split(",") if d.strip()]
+    image_dirs = list(image_dirs or [])
 
     train_csv = os.path.join(split_path, training_features, f"split_{fold}", "train.csv")
     val_csv = os.path.join(split_path, training_features, f"split_{fold}", "val.csv")
@@ -165,6 +327,11 @@ def load_galar(
     label_cols = _label_columns(peek)
     if not label_cols:
         raise ValueError(f"No label columns in {train_csv}. Columns: {list(peek.columns)}")
+
+    if tar_index:
+        return _load_galar_tar(train_csv, val_csv, test_csv, label_cols, image_dirs,
+                               tar_index, shard_dir, batch_size, image_size, num_workers,
+                               max_per_class)
 
     available_videos = _scan_available_videos(image_dirs)
     disk_counts = _scan_disk_counts_per_video(image_dirs)
@@ -189,4 +356,36 @@ def load_galar(
     val_loader = DataLoader(val_ds, shuffle=False, **common)
     test_loader = DataLoader(test_ds, shuffle=False, **common)
 
-    return train_loader, val_loader, test_loader, label_cols
+    return train_loader, val_loader, test_loader, label_cols, None
+
+
+def _load_galar_tar(train_csv, val_csv, test_csv, label_cols, fallback_dirs, tar_index,
+                    shard_dir, batch_size, image_size, num_workers, max_per_class):
+    index = load_tar_index(tar_index)
+    shards_dir = shard_dir or index["shards_dir"]
+    missing_shards = [s for s in index["shards"] if not os.path.isfile(os.path.join(shards_dir, s))]
+    if missing_shards:
+        raise FileNotFoundError(f"Shards listed in the index are missing under {shards_dir}: {missing_shards}")
+    print(f"[datasets_galar] shards_dir={shards_dir} fallback_dirs={fallback_dirs or 'none'}")
+
+    train_tf, eval_tf = build_transforms(image_size)
+    common_ds = dict(index=index, shards_dir=shards_dir, label_cols=label_cols, fallback_dirs=fallback_dirs)
+    # The class cap only thins the training set; val/test keep the true distribution.
+    train_ds = GalarTarDataset(train_csv, transform=train_tf, max_per_class=max_per_class, split="train", **common_ds)
+    val_ds = GalarTarDataset(val_csv, transform=eval_tf, split="val", **common_ds)
+    test_ds = GalarTarDataset(test_csv, transform=eval_tf, split="test", **common_ds)
+    del index, common_ds  # the full dict is ~GBs in RAM; datasets keep compact arrays
+
+    common = dict(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
+    train_loader = DataLoader(train_ds, shuffle=True, drop_last=True,
+                              persistent_workers=num_workers > 0, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, persistent_workers=num_workers > 0, **common)
+    test_loader = DataLoader(test_ds, shuffle=False, **common)
+
+    report = {"train": train_ds.report, "val": val_ds.report, "test": test_ds.report}
+    return train_loader, val_loader, test_loader, label_cols, report
