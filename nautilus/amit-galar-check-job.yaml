@@ -1,9 +1,15 @@
 # amit-galar-check-job.yaml
 #
-# CPU-only pre-flight for amit-train-galar-job.yaml: same dataset settings, no GPU,
-# no training. Prints the split folders, per-video counts of frames read from the
-# tar shards / from image_dir / not found, class counts per split, decodes a few
-# frames and times the DataLoader. Writes nothing except check.log.
+# CPU-only, run before amit-train-galar-job.yaml. No GPU, no training.
+#  1. Builds the tar index from the shards on bpil-galar-pvc into
+#     modex-galar-out:/amit/galar_tar_index.pkl (skipped if it already exists;
+#     reads tar headers only, roughly 30-90 min the first time).
+#  2. Builds train/val/test exactly as training would and prints the split folders,
+#     per-video counts of frames read from the tar shards / from image_dir / not
+#     found, class counts per split, decodes a few frames and times the DataLoader.
+#
+# Reads:  bpil-galar-pvc  (/galar, read-only)  shards + splits_publication
+# Writes: modex-galar-out (/out)  /amit/galar_tar_index.pkl, /amit/modex-galar/check.log
 #
 # Submit: kubectl apply -f nautilus/amit-galar-check-job.yaml -n usd-djha
 # Logs:   kubectl logs -f job/amit-modex-galar-check -n usd-djha
@@ -14,7 +20,7 @@ metadata:
   namespace: usd-djha
 spec:
   backoffLimit: 1
-  activeDeadlineSeconds: 7200
+  activeDeadlineSeconds: 21600
   ttlSecondsAfterFinished: 604800
   template:
     spec:
@@ -41,8 +47,11 @@ spec:
               cd /workspace/galar-modex && echo "code at $(git rev-parse --short HEAD)"
               pip install -q tqdm scikit-learn pillow pandas
               mkdir -p /out/amit/modex-galar
+              python -u build_galar_tar_index.py \
+                --shards_dir /galar/galar/shards \
+                --out /out/amit/galar_tar_index.pkl 2>&1 | tee /out/amit/modex-galar/index.log
               python -u check_galar_tar.py \
-                --tar_index /pvc/results/galar_tar_index.pkl \
+                --tar_index /out/amit/galar_tar_index.pkl \
                 --shard_dir /galar/galar/shards \
                 --image_dir /galar/galar/frames \
                 --split_path /galar/galar/splits_publication \
@@ -56,15 +65,12 @@ spec:
             limits:   { cpu: "8", memory: "19Gi" }   # <= 1.2x request
           volumeMounts:
             - { name: galar,     mountPath: /galar, readOnly: true }
-            - { name: amit,      mountPath: /pvc,   readOnly: true }
             - { name: out,       mountPath: /out }
             - { name: workspace, mountPath: /workspace }
             - { name: dshm,      mountPath: /dev/shm }
       volumes:
         - name: galar
           persistentVolumeClaim: { claimName: bpil-galar-pvc }
-        - name: amit
-          persistentVolumeClaim: { claimName: bpil-amit-pvc }
         - name: out
           persistentVolumeClaim: { claimName: modex-galar-out }
         - name: workspace
