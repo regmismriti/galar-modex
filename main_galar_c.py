@@ -2,9 +2,6 @@ import os
 import json
 import random
 import argparse
-import time
-
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -61,22 +58,17 @@ def get_args():
     parser = argparse.ArgumentParser(description="MODEX on GALAR")
 
     # Data
+    parser.add_argument("--image_dir", type=str, required=True,
+                        help="Fallback image dirs (comma-separated) for videos not in shards (e.g. video 30).")
+    parser.add_argument("--shard_dir", type=str, default="/data/galar/shards",
+                        help="Directory of .tar shards for streaming reads.")
     parser.add_argument("--tar_index", type=str, default=None,
-                        help="Prebuilt tar-offset index (.pkl). When set, frames are read from the tar shards "
-                             "and --image_dir is only a fallback for frames not in any shard.")
-    parser.add_argument("--image_dir", type=str, default="",
-                        help="Comma-separated loose-frame dirs. Required without --tar_index; with it, fallback only.")
-    parser.add_argument("--shard_dir", type=str, default=None,
-                        help="Directory of .tar shards; defaults to the shards_dir stored in the index.")
-    parser.add_argument("--max_per_class", type=int, default=None,
-                        help="Cap training frames per class (val/test untouched). Default: no cap.")
-    parser.add_argument("--filter_unknown", action="store_true",
-                        help="Drop rows with unknown != 0. Off by default, matching the official GalarCapsuleML loader.")
-    parser.add_argument("--check_data_only", action="store_true",
-                        help="Build the datasets, decode a few frames, write data_report.json, then exit (no GPU needed).")
+                        help="Prebuilt tar-offset index (.pkl). When set, frames are read from the .tar shards in "
+                             "--shard_dir and --image_dir is only used for frames not in any shard.")
+    parser.add_argument("--shuffle_buffer", type=int, default=256,
+                        help="In-memory buffer size for randomizing training sample order. Larger = better shuffle but delayed first-batch flow.")
     parser.add_argument("--split_path", type=str, required=True)
-    parser.add_argument("--training_features", type=str, default="section",
-                        help="Official GALAR multiclass task: section (5 classes) or technical_multiclass (3 classes).")
+    parser.add_argument("--training_features", type=str, default="section")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -105,8 +97,6 @@ def get_args():
 
 def main():
     args = get_args()
-    if not args.tar_index and not args.image_dir:
-        raise SystemExit("Pass --tar_index (recommended) or --image_dir.")
     device = args.device if torch.cuda.is_available() else "cpu"
 
     results_dir = os.path.join(args.output_dir, "results_modex_galar")
@@ -117,7 +107,7 @@ def main():
     print(f"[main_galar] loading GALAR: task={args.training_features} fold={args.fold} "
           f"image_size={args.image_size} batch_size={args.batch_size} num_workers={args.num_workers}")
 
-    trainloader, validloader, testloader, label_cols, data_report = load_galar(
+    trainloader, validloader, testloader, label_cols = load_galar(
         image_dirs=args.image_dir,
         split_path=args.split_path,
         training_features=args.training_features,
@@ -125,41 +115,13 @@ def main():
         batch_size=args.batch_size,
         image_size=args.image_size,
         num_workers=args.num_workers,
-        tar_index=args.tar_index,
         shard_dir=args.shard_dir,
-        max_per_class=args.max_per_class,
-        filter_unknown=args.filter_unknown,
+        tar_index=args.tar_index,
+        shuffle_buffer=args.shuffle_buffer,
     )
     num_classes = len(label_cols)
     print(f"[main_galar] num_classes={num_classes} labels={label_cols}")
     print(f"[main_galar] train={len(trainloader.dataset)} val={len(validloader.dataset)} test={len(testloader.dataset)}")
-
-    run_name = f"galar_{args.training_features}_fold{args.fold}"
-    if data_report is not None:
-        with open(os.path.join(results_dir, run_name + "_data_report.json"), "w") as f:
-            json.dump(to_serializable(data_report), f, indent=2)
-
-    if args.check_data_only:
-        task_dir = os.path.join(args.split_path, args.training_features)
-        print(f"[main_galar] {task_dir} contains: {sorted(os.listdir(task_dir))}")
-        for name, rep in (data_report or {}).items():
-            print(f"[main_galar] {name}: columns={rep['columns']} used={rep['used']} classes={rep['class_counts']} "
-                  f"unknown_rows={rep.get('unknown_rows', 'n/a')}")
-        for name, loader in (("train", trainloader), ("val", validloader), ("test", testloader)):
-            ds = loader.dataset
-            for j in np.random.default_rng(0).choice(len(ds), min(8, len(ds)), replace=False):
-                x, y = ds[int(j)]
-                assert x.shape == (3, args.image_size, args.image_size), x.shape
-            print(f"[main_galar] decoded 8 random {name} frames OK")
-        t0, n = time.time(), 0
-        for x, _ in trainloader:
-            n += x.size(0)
-            if n >= 20 * args.batch_size:
-                break
-        print(f"[main_galar] loader throughput: {n / (time.time() - t0):.0f} img/s "
-              f"with {args.num_workers} workers (includes worker start-up)")
-        print(f"[main_galar] check_data_only: done, report under {results_dir}")
-        return
 
     model = MODEXForGALAR(
         num_classes=num_classes,
@@ -182,14 +144,12 @@ def main():
         validloader=validloader,
         num_classes=num_classes,
         device=device,
-        ckpt_path=os.path.join(models_dir, run_name + "_last_ckpt.pt"),
     )
 
     test_acc = test(model, testloader, device)
     conf_auroc, conf_aupr, brier = conf_calibration(model, testloader, device)
 
     result = {
-        "args": vars(args),
         "training_features": args.training_features,
         "fold": args.fold,
         "num_classes": num_classes,
