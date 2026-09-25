@@ -1,0 +1,14 @@
+# Shared results volume: ReadWriteMany on CephFS (same class as bpil-amit-pvc),
+# so several jobs on different nodes can mount it at once.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: modex-results
+  namespace: usd-djha
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: rook-cephfs-central
+  resources:
+    requests:
+      storage: 500Gi
