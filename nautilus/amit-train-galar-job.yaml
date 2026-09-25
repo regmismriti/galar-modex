@@ -46,6 +46,7 @@ spec:
                     values:
                       - nautilus-ext-gpu01.fullerton.edu
                       - hcc-nrp-shor-c5809.unl.edu   # nvidia-smi: "No devices were found" (2026-09-25)
+                      - hcc-nrp-shor-c6017.unl.edu   # CUDA illegal memory access on first step (2026-09-25)
       tolerations:
         - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
       containers:
