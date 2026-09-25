@@ -2,6 +2,7 @@ import io
 import os
 import pickle
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import numpy as np
@@ -123,6 +124,7 @@ class GalarTarDataset(Dataset):
         self.transform = transform
         self.shard_paths = [os.path.join(shards_dir, s) for s in index["shards"]]
         self._fh, self._fh_pid = None, None
+        self._pool = None
 
         df = pd.read_csv(
             csv_path,
@@ -187,6 +189,7 @@ class GalarTarDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_fh"] = None  # file descriptors are per process; workers reopen lazily
+        state["_pool"] = None
         return state
 
     def __len__(self):
@@ -196,12 +199,21 @@ class GalarTarDataset(Dataset):
         if idx in self.loose_paths:
             with open(self.loose_paths[idx], "rb") as f:
                 return f.read()
-        if self._fh is None or self._fh_pid != os.getpid():
-            self._fh, self._fh_pid = {}, os.getpid()
+        self._open_shards()
         si = int(self.shard[idx])
-        if si not in self._fh:
-            self._fh[si] = os.open(self.shard_paths[si], os.O_RDONLY)
         return os.pread(self._fh[si], int(self.size[idx]), int(self.offset[idx]))
+
+    def _open_shards(self):
+        """Open every shard once per process (DataLoader worker), before any threads read."""
+        if self._fh is not None and self._fh_pid == os.getpid():
+            return
+        fh = {}
+        for si, path in enumerate(self.shard_paths):
+            fd = os.open(path, os.O_RDONLY)
+            # reads are scattered across a ~75 GB file: no kernel read-ahead
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+            fh[si] = fd
+        self._fh, self._fh_pid, self._pool = fh, os.getpid(), None
 
     def __getitem__(self, idx):
         with Image.open(io.BytesIO(self._read(idx))) as im:
@@ -209,6 +221,16 @@ class GalarTarDataset(Dataset):
                 im = im.convert("RGB")
             img = self.transform(im)
         return img, int(self.targets[idx])
+
+    def __getitems__(self, indices):
+        """Batch fetch used by the DataLoader: the frames of a batch are read and
+        decoded concurrently instead of one after another, since each read from
+        CephFS spends most of its time waiting on the network. Same samples, same
+        order as calling __getitem__ on each index."""
+        self._open_shards()
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=32)
+        return list(self._pool.map(self.__getitem__, indices))
 
 
 def build_transforms(image_size: int):
