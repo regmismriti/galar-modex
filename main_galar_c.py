@@ -70,10 +70,13 @@ def get_args():
                         help="Directory of .tar shards; defaults to the shards_dir stored in the index.")
     parser.add_argument("--max_per_class", type=int, default=None,
                         help="Cap training frames per class (val/test untouched). Default: no cap.")
+    parser.add_argument("--filter_unknown", action="store_true",
+                        help="Drop rows with unknown != 0. Off by default, matching the official GalarCapsuleML loader.")
     parser.add_argument("--check_data_only", action="store_true",
                         help="Build the datasets, decode a few frames, write data_report.json, then exit (no GPU needed).")
     parser.add_argument("--split_path", type=str, required=True)
-    parser.add_argument("--training_features", type=str, default="section")
+    parser.add_argument("--training_features", type=str, default="section",
+                        help="Official GALAR multiclass task: section (5 classes) or technical_multiclass (3 classes).")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -125,6 +128,7 @@ def main():
         tar_index=args.tar_index,
         shard_dir=args.shard_dir,
         max_per_class=args.max_per_class,
+        filter_unknown=args.filter_unknown,
     )
     num_classes = len(label_cols)
     print(f"[main_galar] num_classes={num_classes} labels={label_cols}")
@@ -136,6 +140,11 @@ def main():
             json.dump(to_serializable(data_report), f, indent=2)
 
     if args.check_data_only:
+        task_dir = os.path.join(args.split_path, args.training_features)
+        print(f"[main_galar] {task_dir} contains: {sorted(os.listdir(task_dir))}")
+        for name, rep in (data_report or {}).items():
+            print(f"[main_galar] {name}: columns={rep['columns']} used={rep['used']} classes={rep['class_counts']} "
+                  f"unknown_rows={rep.get('unknown_rows', 'n/a')}")
         for name, loader in (("train", trainloader), ("val", validloader), ("test", testloader)):
             ds = loader.dataset
             for j in np.random.default_rng(0).choice(len(ds), min(8, len(ds)), replace=False):

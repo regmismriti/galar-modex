@@ -1,12 +1,13 @@
 # amit-train-galar-job.yaml
 #
-# MODEX on GALAR (section task, fold 0), reading frames from the tar shards via the
+# MODEX on the official GALAR multiclass split (TASK/FOLD below; default section,
+# fold 0 of splits_publication, as in GalarCapsuleML), reading frames from the tar shards via the
 # prebuilt offset index instead of the extracted PNGs spread over 3 PVCs.
 # Run nautilus/amit-galar-check-job.yaml first and check its data report.
 #
 # Reads:  bpil-galar-pvc  (/galar, read-only)  tar shards + splits_publication
 #         bpil-amit-pvc   (/pvc,   read-only)  /pvc/results/galar_tar_index.pkl
-# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/section_fold0/
+# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/<TASK>_fold<FOLD>/
 #           results_modex_galar/*.json   metrics + data report
 #           models_modex_galar/*.pt      final weights + per-epoch resume checkpoint
 #           train.log                    full stdout (pods are garbage-collected)
@@ -64,7 +65,9 @@ spec:
             - { name: TQDM_MININTERVAL, value: "60" }   # one progress line/min, not a flood
             - { name: REPO, value: "https://github.com/regmismriti/galar-modex.git" }
             - { name: BRANCH, value: "amit" }
-            - { name: OUT, value: "/out/amit/modex-galar/section_fold0" }
+            - { name: TASK, value: "section" }   # official multiclass task: section | technical_multiclass
+            - { name: FOLD, value: "0" }         # official splits have folds 0-4
+            - { name: OUT, value: "/out/amit/modex-galar/$(TASK)_fold$(FOLD)" }
             - name: GITHUB_PAT
               valueFrom:
                 { secretKeyRef: { name: github-pat, key: token, optional: true } }
@@ -86,8 +89,8 @@ spec:
                 --shard_dir /galar/galar/shards \
                 --image_dir /galar/galar/frames \
                 --split_path /galar/galar/splits_publication \
-                --training_features section \
-                --fold 0 \
+                --training_features "$TASK" \
+                --fold "$FOLD" \
                 --image_size 256 \
                 --batch_size 64 \
                 --num_workers 10 \

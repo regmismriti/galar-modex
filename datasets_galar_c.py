@@ -14,6 +14,13 @@ from PIL import Image
 
 NON_LABEL_COLUMNS = {"path", "unknown"}
 
+# Official GALAR multiclass tasks and their class columns, in the order used by
+# github.com/EKFZ-AI-Endoscopy/GalarCapsuleML (train.py / generate_folds.py).
+TASK_LABELS = {
+    "section": ["mouth", "esophagus", "stomach", "small intestine", "colon"],
+    "technical_multiclass": ["good view", "reduced view", "no view"],
+}
+
 
 def _label_columns(df: pd.DataFrame):
     return [c for c in df.columns if c not in NON_LABEL_COLUMNS]
@@ -26,23 +33,49 @@ def _norm_key(name):
     return os.path.normpath(str(name)).lstrip("./")
 
 
-def _read_split_csv(csv_path, label_cols):
-    """Same row filtering as GalarCSVDataset: drop unknown=1 rows and rows that do
-    not have exactly one active label. Returns (paths, targets)."""
-    df = pd.read_csv(
-        csv_path,
-        dtype={"unknown": "str"} if "unknown" in pd.read_csv(csv_path, nrows=0).columns else None,
-    )
+def _lookup_key(path, entries):
+    """Index key for a CSV path. Official split CSVs zero-pad the video id
+    ('003/frame_...'); tolerate either padding on the index side."""
+    if path in entries:
+        return path
+    video, _, fname = path.partition("/")
+    if video.isdigit():
+        for alt in (str(int(video)), video.zfill(3)):
+            key = f"{alt}/{fname}"
+            if key in entries:
+                return key
+    return None
+
+
+def _read_split_csv(csv_path, label_cols, filter_unknown=False):
+    """Returns (paths, targets, stats). Label = the one active class column, as in
+    the official loader. Rows with zero or several active classes are dropped
+    (the official loader's argmax would silently call them class 0) and counted.
+    unknown != 0 rows are only dropped with filter_unknown (official: kept)."""
+    header = pd.read_csv(csv_path, nrows=0).columns
+    missing = [c for c in label_cols if c not in header]
+    if missing:
+        raise ValueError(f"{csv_path} lacks label columns {missing}; columns are {list(header)}")
+    df = pd.read_csv(csv_path, dtype={"unknown": "str"} if "unknown" in header else None)
+    stats = {"columns": list(header), "csv_rows": len(df)}
+
     if "unknown" in df.columns:
-        df = df[df["unknown"].fillna("0") == "0"].reset_index(drop=True)
+        is_unknown = df["unknown"].fillna("0") != "0"
+        stats["unknown_rows"] = int(is_unknown.sum())
+        if filter_unknown and is_unknown.any():
+            df = df[~is_unknown].reset_index(drop=True)
 
     onehot = df[label_cols].values.astype(np.int64)
-    keep = onehot.sum(axis=1) == 1
+    active = onehot.sum(axis=1)
+    stats["rows_no_label"] = int((active == 0).sum())
+    stats["rows_multi_label"] = int((active > 1).sum())
+    keep = active == 1
     if not keep.all():
-        print(f"[datasets_galar] {csv_path}: dropped {int((~keep).sum())}/{len(df)} rows without exactly one active label")
+        print(f"[datasets_galar] {csv_path}: dropped {int((~keep).sum())}/{len(df)} rows without exactly one "
+              f"active label ({stats['rows_no_label']} none, {stats['rows_multi_label']} several)")
         df = df.loc[keep].reset_index(drop=True)
         onehot = onehot[keep]
-    return df["path"].map(_norm_key).tolist(), onehot.argmax(axis=1).astype(np.int64)
+    return df["path"].map(_norm_key).tolist(), onehot.argmax(axis=1).astype(np.int64), stats
 
 
 def load_tar_index(tar_index_path):
@@ -66,15 +99,16 @@ class GalarTarDataset(Dataset):
     workers share them copy-on-write instead of each duplicating the index."""
 
     def __init__(self, csv_path, index, shards_dir, transform, label_cols,
-                 fallback_dirs=(), max_per_class=None, seed=0, split="train"):
+                 fallback_dirs=(), max_per_class=None, seed=0, split="train", filter_unknown=False):
         self.transform = transform
         self.shard_paths = [os.path.join(shards_dir, s) for s in index["shards"]]
         self._fh = None  # per-process file descriptors, opened lazily
         self._fh_pid = None
 
-        paths, targets = _read_split_csv(csv_path, label_cols)
+        paths, targets, csv_stats = _read_split_csv(csv_path, label_cols, filter_unknown)
         entries = index["index"]
-        in_index = np.fromiter((p in entries for p in paths), dtype=bool, count=len(paths))
+        keys = [_lookup_key(p, entries) for p in paths]
+        in_index = np.array([k is not None for k in keys], dtype=bool)
 
         # Frames not in the tar shards: optionally recover from a loose-frame dir.
         # One listdir per affected video, never an os.path.exists per row.
@@ -85,21 +119,26 @@ class GalarTarDataset(Dataset):
             listing = {}
             for i in missing:
                 video, fname = paths[i].split("/", 1)
+                videos = [video] + ([str(int(video)), video.zfill(3)] if video.isdigit() else [])
                 for base in fallback_dirs:
-                    key = (base, video)
-                    if key not in listing:
-                        try:
-                            listing[key] = set(os.listdir(os.path.join(base, video)))
-                        except OSError:
-                            listing[key] = set()
-                    if fname in listing[key]:
-                        fallback[i] = True
-                        fallback_path[i] = os.path.join(base, paths[i])
+                    for v in dict.fromkeys(videos):
+                        key = (base, v)
+                        if key not in listing:
+                            try:
+                                listing[key] = set(os.listdir(os.path.join(base, v)))
+                            except OSError:
+                                listing[key] = set()
+                        if fname in listing[key]:
+                            fallback[i] = True
+                            fallback_path[i] = os.path.join(base, v, fname)
+                            break
+                    if fallback[i]:
                         break
 
         dropped = ~in_index & ~fallback
         self.report = {
             "csv": csv_path,
+            **csv_stats,
             "rows": len(paths),
             "from_tar": int(in_index.sum()),
             "from_fallback_dir": int(fallback.sum()),
@@ -134,7 +173,7 @@ class GalarTarDataset(Dataset):
         self.fallback_paths = {}
         for j, i in enumerate(keep):
             if in_index[i]:
-                self.shard[j], self.offset[j], self.size[j] = entries[paths[i]]
+                self.shard[j], self.offset[j], self.size[j] = entries[keys[i]]
             else:
                 self.fallback_paths[j] = fallback_path[i]
         self.targets = targets[keep]
@@ -307,6 +346,7 @@ def load_galar(
     tar_index: str = None,
     shard_dir: str = None,
     max_per_class: int = None,
+    filter_unknown: bool = False,
     **_ignored,
 ):
     """With `tar_index`, frames are read from the tar shards and `image_dirs` is only
@@ -323,15 +363,17 @@ def load_galar(
         if not os.path.isfile(p):
             raise FileNotFoundError(f"Missing split CSV: {p}")
 
+    if tar_index:
+        if training_features not in TASK_LABELS:
+            raise ValueError(f"Unknown multiclass task {training_features!r}; expected one of {list(TASK_LABELS)}")
+        return _load_galar_tar(train_csv, val_csv, test_csv, TASK_LABELS[training_features], image_dirs,
+                               tar_index, shard_dir, batch_size, image_size, num_workers,
+                               max_per_class, filter_unknown)
+
     peek = pd.read_csv(train_csv, nrows=0)
     label_cols = _label_columns(peek)
     if not label_cols:
         raise ValueError(f"No label columns in {train_csv}. Columns: {list(peek.columns)}")
-
-    if tar_index:
-        return _load_galar_tar(train_csv, val_csv, test_csv, label_cols, image_dirs,
-                               tar_index, shard_dir, batch_size, image_size, num_workers,
-                               max_per_class)
 
     available_videos = _scan_available_videos(image_dirs)
     disk_counts = _scan_disk_counts_per_video(image_dirs)
@@ -360,7 +402,7 @@ def load_galar(
 
 
 def _load_galar_tar(train_csv, val_csv, test_csv, label_cols, fallback_dirs, tar_index,
-                    shard_dir, batch_size, image_size, num_workers, max_per_class):
+                    shard_dir, batch_size, image_size, num_workers, max_per_class, filter_unknown):
     index = load_tar_index(tar_index)
     shards_dir = shard_dir or index["shards_dir"]
     missing_shards = [s for s in index["shards"] if not os.path.isfile(os.path.join(shards_dir, s))]
@@ -369,7 +411,8 @@ def _load_galar_tar(train_csv, val_csv, test_csv, label_cols, fallback_dirs, tar
     print(f"[datasets_galar] shards_dir={shards_dir} fallback_dirs={fallback_dirs or 'none'}")
 
     train_tf, eval_tf = build_transforms(image_size)
-    common_ds = dict(index=index, shards_dir=shards_dir, label_cols=label_cols, fallback_dirs=fallback_dirs)
+    common_ds = dict(index=index, shards_dir=shards_dir, label_cols=label_cols, fallback_dirs=fallback_dirs,
+                     filter_unknown=filter_unknown)
     # The class cap only thins the training set; val/test keep the true distribution.
     train_ds = GalarTarDataset(train_csv, transform=train_tf, max_per_class=max_per_class, split="train", **common_ds)
     val_ds = GalarTarDataset(val_csv, transform=eval_tf, split="val", **common_ds)

@@ -2,6 +2,9 @@ Implementation of galar modex
 
 ## Running on GALAR from the tar shards (Nautilus)
 
+Tasks follow the official GalarCapsuleML multiclass splits (`splits_publication/section` with
+5 classes, or `technical_multiclass` with 3; folds 0-4 plus a shared test set).
+
 `main_galar_c.py --tar_index <index.pkl>` reads frames directly from the 8 GALAR tar
 shards on `bpil-galar-pvc` using a prebuilt name -> (shard, offset, size) index,
 instead of extracted PNGs spread across several PVCs. `--image_dir` then only serves

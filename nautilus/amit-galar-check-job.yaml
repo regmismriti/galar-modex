@@ -7,8 +7,8 @@
 #
 # Reads:  bpil-galar-pvc  (/galar, read-only)  tar shards + splits_publication
 #         bpil-amit-pvc   (/pvc,   read-only)  /pvc/results/galar_tar_index.pkl
-# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/section_fold0/results_modex_galar/
-#         galar_section_fold0_data_report.json  and  check.log
+# Writes: modex-galar-out (/out)  ->  /out/amit/modex-galar/<TASK>_fold<FOLD>/results_modex_galar/
+#         galar_<TASK>_fold<FOLD>_data_report.json  and  check.log
 #
 # Submit: kubectl apply -f nautilus/amit-galar-check-job.yaml -n usd-djha
 # Logs:   kubectl logs -f job/amit-modex-galar-check -n usd-djha
@@ -32,7 +32,9 @@ spec:
             - { name: PIP_NO_CACHE_DIR, value: "1" }
             - { name: REPO, value: "https://github.com/regmismriti/galar-modex.git" }
             - { name: BRANCH, value: "amit" }
-            - { name: OUT, value: "/out/amit/modex-galar/section_fold0" }
+            - { name: TASK, value: "section" }   # official multiclass task: section | technical_multiclass
+            - { name: FOLD, value: "0" }         # official splits have folds 0-4
+            - { name: OUT, value: "/out/amit/modex-galar/$(TASK)_fold$(FOLD)" }
             - name: GITHUB_PAT
               valueFrom:
                 { secretKeyRef: { name: github-pat, key: token, optional: true } }
@@ -53,8 +55,8 @@ spec:
                 --shard_dir /galar/galar/shards \
                 --image_dir /galar/galar/frames \
                 --split_path /galar/galar/splits_publication \
-                --training_features section \
-                --fold 0 \
+                --training_features "$TASK" \
+                --fold "$FOLD" \
                 --image_size 256 \
                 --batch_size 64 \
                 --num_workers 10 \
