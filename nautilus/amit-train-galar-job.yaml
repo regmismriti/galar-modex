@@ -79,8 +79,8 @@ spec:
                 --num_epochs 50 \
                 --output_dir /out/amit/modex-galar 2>&1 | tee -a /out/amit/modex-galar/train.log
           resources:
-            requests: { cpu: "12", memory: "32Gi", nvidia.com/gpu: "1" }
-            limits:   { cpu: "12", memory: "32Gi", nvidia.com/gpu: "1" }
+            requests: { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "8", memory: "32Gi", nvidia.com/gpu: "1" }
           volumeMounts:
             - { name: galar,     mountPath: /galar, readOnly: true }
             - { name: index,     mountPath: /pvc,   readOnly: true }   # tar index only, read once at start
